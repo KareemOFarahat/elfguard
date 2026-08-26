@@ -1,0 +1,13 @@
+# build artefacts
+*.o
+elfguard
+
+# test scratch
+tests/tmp/
+tests/crash-*.bin
+
+# editors
+.vscode/
+.idea/
+*.swp
+compile_commands.json

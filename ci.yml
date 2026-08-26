@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (warnings are errors)
+        run: make CC=${{ matrix.cc }} EXTRA_CFLAGS=-Werror
+
+      - name: Test suite
+        run: make CC=${{ matrix.cc }} test
+
+      - name: Self-audit
+        run: make CC=${{ matrix.cc }} check-self
+
+      - name: Rebuild under ASan + UBSan
+        run: make CC=${{ matrix.cc }} asan
+
+      - name: Fuzz every view under sanitisers
+        run: |
+          gcc -O2 -w -fcf-protection=full -fstack-protector-strong \
+              -D_FORTIFY_SOURCE=2 -fPIE -pie -rdynamic \
+              -Wl,-z,relro,-z,now -o /tmp/seed tests/seed.c
+          fails=0
+          for i in $(seq 1 500); do
+            cp /tmp/seed /tmp/m
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              off=$((RANDOM % 4096))
+              printf "$(printf '\\x%02x' $((RANDOM % 256)))" \
+                | dd of=/tmp/m bs=1 seek=$off count=1 conv=notrunc status=none
+            done
+            out=$(./elfguard -n -e -d -u -R /tmp/m 2>&1) || true
+            case "$out" in
+              *AddressSanitizer*|*"runtime error"*)
+                fails=$((fails+1)); echo "$out" | head -25 ;;
+            esac
+          done
+          echo "sanitiser findings: $fails"
+          [ "$fails" -eq 0 ]
+
+  # Proves the tool does the job it exists for: gating on the direction of
+  # travel rather than on an absolute score.
+  posture-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build elfguard
+        run: make
+
+      - name: Build a hardened baseline and a regressed candidate
+        run: |
+          mkdir -p /tmp/baseline /tmp/candidate
+          gcc -O2 -w -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+              -fcf-protection=full -fPIE -pie -Wl,-z,relro,-z,now \
+              -o /tmp/baseline/app tests/seed.c
+          gcc -O0 -w -fno-stack-protector -fcf-protection=none -no-pie \
+              -o /tmp/candidate/app tests/seed.c
+
+      - name: The gate must fire on a regression
+        run: |
+          if ./elfguard --no-color --diff /tmp/baseline /tmp/candidate; then
+            echo "::error::diff mode failed to flag a known regression"
+            exit 1
+          fi
+          echo "regression correctly detected"
+
+      - name: The gate must stay quiet when nothing changed
+        run: ./elfguard --no-color --diff /tmp/baseline /tmp/baseline
+
+      - name: Surface growth alone must not fail the build
+        run: |
+          # Adding exports is ordinary development. A gate that fires on it
+          # gets switched off within a week, so assert it stays green.
+          mkdir -p /tmp/g1 /tmp/g2
+          cp /tmp/baseline/app /tmp/g1/app
+          gcc -O2 -w -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+              -fcf-protection=full -fPIE -pie -rdynamic \
+              -Wl,-z,relro,-z,now -o /tmp/g2/app tests/seed.c
+          ./elfguard --no-color --diff /tmp/g1 /tmp/g2
+
+      - name: Trend must flag a regressed build in a series
+        run: |
+          mkdir -p /tmp/hist/b01 /tmp/hist/b02 /tmp/hist/b03
+          cp /tmp/baseline/app  /tmp/hist/b01/app
+          cp /tmp/candidate/app /tmp/hist/b02/app
+          cp /tmp/baseline/app  /tmp/hist/b03/app
+          ./elfguard --no-color --trend /tmp/hist | tee /tmp/trend.txt
+          grep -q REGRESSION /tmp/trend.txt
+
+  # The JSON consumer must never see less than the terminal reader. Validators
+  # live in tests/validate_output.py so the same checks run under `make test`.
+  machine-output:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build elfguard
+        run: make
+
+      - name: Produce fixtures
+        run: |
+          mkdir -p /tmp/baseline /tmp/candidate /tmp/hist/b01 /tmp/hist/b02
+          gcc -O2 -w -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+              -fcf-protection=full -fPIE -pie -Wl,-z,relro,-z,now \
+              -o /tmp/baseline/app tests/seed.c
+          gcc -O0 -w -fno-stack-protector -fcf-protection=none -no-pie \
+              -o /tmp/candidate/app tests/seed.c
+          cp /tmp/baseline/app  /tmp/hist/b01/app
+          cp /tmp/candidate/app /tmp/hist/b02/app
+          ./elfguard --json --surface --deps --reason /tmp/candidate/app > /tmp/audit.json
+          ./elfguard --json --diff /tmp/baseline /tmp/candidate > /tmp/diff.json
+          ./elfguard --json --trend /tmp/hist > /tmp/trend.json
+          ./elfguard --sarif /tmp/candidate/app > /tmp/out.sarif
+
+      - name: Validate audit, surface, diff, trend and SARIF
+        run: |
+          python3 tests/validate_output.py audit   /tmp/audit.json
+          python3 tests/validate_output.py surface /tmp/audit.json
+          python3 tests/validate_output.py diff    /tmp/diff.json
+          python3 tests/validate_output.py trend   /tmp/trend.json
+          python3 tests/validate_output.py sarif   /tmp/out.sarif
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: /tmp/out.sarif
+        continue-on-error: true
